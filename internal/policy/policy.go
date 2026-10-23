@@ -19,13 +19,16 @@ type Document struct {
 // Statement is a single IAM policy statement. A statement names its actions
 // with Action or NotAction, and its resources with Resource or NotResource.
 type Statement struct {
-	Sid         string                     `json:"Sid,omitempty"`
-	Effect      string                     `json:"Effect"`
-	Action      actionField                `json:"Action,omitempty"`
-	NotAction   actionField                `json:"NotAction,omitempty"`
-	Resource    resourceField              `json:"Resource,omitempty"`
-	NotResource resourceField              `json:"NotResource,omitempty"`
-	Condition   map[string]json.RawMessage `json:"Condition,omitempty"`
+	Sid         string        `json:"Sid,omitempty"`
+	Effect      string        `json:"Effect"`
+	Action      actionField   `json:"Action,omitempty"`
+	NotAction   actionField   `json:"NotAction,omitempty"`
+	Resource    resourceField `json:"Resource,omitempty"`
+	NotResource resourceField `json:"NotResource,omitempty"`
+	// Condition is the statement's condition block, decoded. A block the
+	// tool cannot read stays in the statement as an unreadable condition,
+	// so the statement is still conditional.
+	Condition conditionBlock `json:"Condition,omitempty"`
 }
 
 // statementList handles a Statement given as one object or as an array.
@@ -108,7 +111,14 @@ func Parse(raw []byte) (*Document, error) {
 // and has no Condition. An action that takes no resource is matched against
 // "*" by AWS, which an arn: pattern does not match. The tool cannot tell such
 // actions apart, so it may report one as missing behind an arn:* Deny.
-func (d *Document) Covers(action string) bool {
+//
+// conds holds the condition key values the plan supplies. A condition that
+// provably cannot match one of them means the grant does not apply.
+func (d *Document) Covers(action string, conds Conditions) bool {
+	return d.covers(action, conds)
+}
+
+func (d *Document) covers(action string, conds Conditions) bool {
 	allowed := false
 	for _, s := range d.Statements {
 		if !s.matchesAction(action) {
@@ -120,18 +130,12 @@ func (d *Document) Covers(action string) bool {
 				return false
 			}
 		case "Allow":
-			allowed = true
+			if s.conditionHolds(conds) {
+				allowed = true
+			}
 		}
 	}
 	return allowed
-}
-
-// conditional reports whether the statement carries a Condition. The tool
-// cannot evaluate condition keys, so a conditional Deny never counts as a
-// definite deny, and a conditional Allow still counts as an allow: either way
-// only provable gaps are reported. An empty Condition block sets no condition.
-func (s Statement) conditional() bool {
-	return len(s.Condition) > 0
 }
 
 // matchesAction reports whether the statement names action, through Action or
@@ -297,25 +301,6 @@ func globContains(outer, inner string) bool {
 		}
 	}
 	return reach[len(outer)][len(inner)]
-}
-
-// grantsOnlyOnScopedResources reports whether every Allow statement that names
-// action limits it to some resources: a Resource list without a pattern that
-// matches every ARN, or a NotResource list. Such a grant covers the action only
-// for the right target, so without a target ARN the tool cannot confirm it.
-// It returns false when no Allow statement names the action.
-func (d *Document) grantsOnlyOnScopedResources(action string) bool {
-	scoped := false
-	for _, s := range d.Statements {
-		if s.Effect != "Allow" || !s.matchesAction(action) {
-			continue
-		}
-		if s.grantsEveryResource() {
-			return false
-		}
-		scoped = true
-	}
-	return scoped
 }
 
 // grantsEveryResource reports whether a Resource pattern matches every ARN,

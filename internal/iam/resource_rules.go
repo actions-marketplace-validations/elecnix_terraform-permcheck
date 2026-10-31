@@ -76,8 +76,20 @@ var resourceRules = map[string]resourceRule{
 	// A regional custom domain makes API Gateway create its service-linked
 	// role.
 	"aws_apigatewayv2_domain_name": {serviceLinkedRoles: []string{"ops.apigateway.amazonaws.com"}},
+	// A connection makes EventBridge create the service-linked role its API
+	// destinations use.
+	"aws_cloudwatch_event_connection": {serviceLinkedRoles: []string{"apidestinations.events.amazonaws.com"}},
 	// Enabling Inspector creates its service-linked role.
 	"aws_inspector2_enabler": {serviceLinkedRoles: []string{"inspector2.amazonaws.com"}},
+
+	// The first use of these services in an account makes AWS create the
+	// service-linked role the service runs under.
+	"aws_ecs_cluster":       {serviceLinkedRoles: []string{"ecs.amazonaws.com"}},
+	"aws_autoscaling_group": {serviceLinkedRoles: []string{"autoscaling.amazonaws.com"}},
+	"aws_lb":                {serviceLinkedRoles: []string{"elasticloadbalancing.amazonaws.com"}},
+	"aws_db_instance":       {serviceLinkedRoles: []string{"rds.amazonaws.com"}},
+	"aws_rds_cluster":       {serviceLinkedRoles: []string{"rds.amazonaws.com"}},
+	"aws_eks_cluster":       {serviceLinkedRoles: []string{"eks.amazonaws.com"}},
 
 	"aws_wafv2_web_acl_association": {callbacks: &crossServiceRule{
 		arnAttribute: "resource_arn",

@@ -45,3 +45,44 @@ func TestServiceLinkedRole_WrongServicePath(t *testing.T) {
 		t.Errorf("a grant for another service must not cover it, got %+v", m)
 	}
 }
+
+func eventConnectionChange(change string) *plan.ResourceChange {
+	return &plan.ResourceChange{
+		Type: "aws_cloudwatch_event_connection", Name: "example", Change: change,
+		AttributeValues: map[string]string{"name": "example-connection"},
+	}
+}
+
+func TestServiceLinkedRole_EventConnectionMissingOnCreate(t *testing.T) {
+	m := impliedMissing(eventConnectionChange("create"), grantActions("events:*"), nil, false)
+	if !hasActionOn(m, "iam:CreateServiceLinkedRole", "aws_cloudwatch_event_connection", "example") {
+		t.Fatalf("expected iam:CreateServiceLinkedRole missing, got %+v", m)
+	}
+}
+
+func TestServiceLinkedRole_EventConnectionCoveredByItsPath(t *testing.T) {
+	doc := mustPolicy(t, `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:CreateServiceLinkedRole","Resource":"arn:aws:iam::123456789012:role/aws-service-role/apidestinations.events.amazonaws.com/*"}]}`)
+	if m := impliedMissing(eventConnectionChange("create"), doc, nil, false); len(m) != 0 {
+		t.Errorf("expected covered, got %+v", m)
+	}
+}
+
+func TestServiceLinkedRole_FirstUseOfAService(t *testing.T) {
+	for typ, principal := range map[string]string{
+		"aws_ecs_cluster":       "ecs.amazonaws.com",
+		"aws_autoscaling_group": "autoscaling.amazonaws.com",
+		"aws_lb":                "elasticloadbalancing.amazonaws.com",
+		"aws_db_instance":       "rds.amazonaws.com",
+		"aws_rds_cluster":       "rds.amazonaws.com",
+		"aws_eks_cluster":       "eks.amazonaws.com",
+	} {
+		rc := &plan.ResourceChange{Type: typ, Name: "example", Change: "create", AttributeValues: map[string]string{}}
+		if m := impliedMissing(rc, grantNothing(), nil, false); !hasActionOn(m, "iam:CreateServiceLinkedRole", typ, "example") {
+			t.Errorf("%s: expected iam:CreateServiceLinkedRole missing, got %+v", typ, m)
+		}
+		doc := mustPolicy(t, `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:CreateServiceLinkedRole","Resource":"arn:aws:iam::123456789012:role/aws-service-role/`+principal+`/*"}]}`)
+		if m := impliedMissing(rc, doc, nil, false); len(m) != 0 {
+			t.Errorf("%s: a grant on %s must cover, got %+v", typ, principal, m)
+		}
+	}
+}

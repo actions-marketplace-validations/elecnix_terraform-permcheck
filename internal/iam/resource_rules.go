@@ -21,6 +21,11 @@ type resourceRule struct {
 	// to a service. AWS checks iam:PassRole on that role, though the
 	// provider never calls it.
 	passesRole []string
+	// passedToService is the service principal that receives the role, such
+	// as "lambda.amazonaws.com". AWS sets iam:PassedToService to it on the
+	// iam:PassRole check, so a grant limited to another service does not
+	// cover the resource.
+	passedToService string
 	// callbacks are the actions AWS calls in the target's service, or nil.
 	callbacks *crossServiceRule
 	// serviceLinkedRoles lists the service principals whose service-linked
@@ -28,6 +33,9 @@ type resourceRule struct {
 	// "ops.apigateway.amazonaws.com". AWS checks iam:CreateServiceLinkedRole
 	// on each, though the provider never calls it.
 	serviceLinkedRoles []string
+	// managedSecret describes the Secrets Manager secret the service creates
+	// for the resource, or is nil.
+	managedSecret *managedSecret
 	// conditionKeys lists the condition keys the plan can supply for the
 	// resource, and the actions each one gates. A policy may grant an
 	// action only when such a key holds a value, and the tool can check
@@ -53,12 +61,28 @@ var resourceRules = map[string]resourceRule{
 	// value or a reference to a managed log group.
 	"aws_cloudwatch_log_stream": {targets: logStreamTargetARNs},
 
-	"aws_lambda_function":          {passesRole: []string{"role"}},
-	"aws_sfn_state_machine":        {passesRole: []string{"role_arn"}},
-	"aws_codebuild_project":        {passesRole: []string{"service_role"}},
-	"aws_ecs_task_definition":      {passesRole: []string{"execution_role_arn", "task_role_arn"}},
-	"aws_cloudwatch_event_target":  {passesRole: []string{"role_arn"}},
-	"aws_apigatewayv2_integration": {passesRole: []string{"credentials_arn"}},
+	// An invocation is its own target. Its qualifier, $LATEST unless set,
+	// is part of the ARN IAM checks the invoke against.
+	"aws_lambda_invocation": {targets: ownTarget(lambdaInvocationARNPatterns)},
+
+	"aws_lambda_function":          {passesRole: []string{"role"}, passedToService: "lambda.amazonaws.com"},
+	"aws_sfn_state_machine":        {passesRole: []string{"role_arn"}, passedToService: "states.amazonaws.com"},
+	"aws_codebuild_project":        {passesRole: []string{"service_role"}, passedToService: "codebuild.amazonaws.com"},
+	"aws_ecs_task_definition":      {passesRole: []string{"execution_role_arn", "task_role_arn"}, passedToService: "ecs-tasks.amazonaws.com"},
+	"aws_cloudwatch_event_target":  {passesRole: []string{"role_arn"}, passedToService: "events.amazonaws.com"},
+	"aws_apigatewayv2_integration": {passesRole: []string{"credentials_arn"}, passedToService: "apigateway.amazonaws.com"},
+	// The role of a scheduler target sits inside the target block, which the
+	// plan shows as set. The block is required, so every create passes a role.
+	"aws_scheduler_schedule":          {passesRole: []string{"target"}, passedToService: "scheduler.amazonaws.com"},
+	"aws_pipes_pipe":                  {passesRole: []string{"role_arn"}, passedToService: "pipes.amazonaws.com"},
+	"aws_glue_job":                    {passesRole: []string{"role_arn"}, passedToService: "glue.amazonaws.com"},
+	"aws_cloudtrail":                  {passesRole: []string{"cloud_watch_logs_role_arn"}, passedToService: "cloudtrail.amazonaws.com"},
+	"aws_flow_log":                    {passesRole: []string{"iam_role_arn"}, passedToService: "vpc-flow-logs.amazonaws.com"},
+	"aws_eks_cluster":                 {passesRole: []string{"role_arn"}, passedToService: "eks.amazonaws.com", serviceLinkedRoles: []string{"eks.amazonaws.com"}},
+	"aws_api_gateway_integration":     {passesRole: []string{"credentials"}, passedToService: "apigateway.amazonaws.com"},
+	"aws_cloudwatch_event_rule":       {passesRole: []string{"role_arn"}, passedToService: "events.amazonaws.com"},
+	"aws_sagemaker_notebook_instance": {passesRole: []string{"role_arn"}, passedToService: "sagemaker.amazonaws.com"},
+	"aws_batch_compute_environment":   {passesRole: []string{"service_role"}, passedToService: "batch.amazonaws.com"},
 
 	// A Lambda event source mapping is authorized on Resource: "*", so a
 	// least-privilege policy scopes it with the lambda:FunctionArn
@@ -77,8 +101,17 @@ var resourceRules = map[string]resourceRule{
 	// role.
 	"aws_apigatewayv2_domain_name": {serviceLinkedRoles: []string{"ops.apigateway.amazonaws.com"}},
 	// A connection makes EventBridge create the service-linked role its API
-	// destinations use.
-	"aws_cloudwatch_event_connection": {serviceLinkedRoles: []string{"apidestinations.events.amazonaws.com"}},
+	// destinations use, and a secret for its credentials.
+	"aws_cloudwatch_event_connection": {
+		serviceLinkedRoles: []string{"apidestinations.events.amazonaws.com"},
+		managedSecret: &managedSecret{
+			prefix: "events!connection/",
+			actions: map[string][]string{
+				"create": {"secretsmanager:CreateSecret", "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"},
+				"update": {"secretsmanager:CreateSecret", "secretsmanager:UpdateSecret", "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"},
+			},
+		},
+	},
 	// Enabling Inspector creates its service-linked role.
 	"aws_inspector2_enabler": {serviceLinkedRoles: []string{"inspector2.amazonaws.com"}},
 
@@ -89,7 +122,6 @@ var resourceRules = map[string]resourceRule{
 	"aws_lb":                {serviceLinkedRoles: []string{"elasticloadbalancing.amazonaws.com"}},
 	"aws_db_instance":       {serviceLinkedRoles: []string{"rds.amazonaws.com"}},
 	"aws_rds_cluster":       {serviceLinkedRoles: []string{"rds.amazonaws.com"}},
-	"aws_eks_cluster":       {serviceLinkedRoles: []string{"eks.amazonaws.com"}},
 
 	"aws_wafv2_web_acl_association": {callbacks: &crossServiceRule{
 		arnAttribute: "resource_arn",

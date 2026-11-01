@@ -239,11 +239,23 @@ rather than only the action name:
 - `iam:PassRole` is required for resources that hand a role to a service
   (`aws_lambda_function`, `aws_sfn_state_machine`, `aws_codebuild_project`,
   `aws_ecs_task_definition`, `aws_cloudwatch_event_target`,
-  `aws_apigatewayv2_integration`). The role comes from a literal ARN in the
+  `aws_apigatewayv2_integration`, `aws_scheduler_schedule`, `aws_pipes_pipe`,
+  `aws_glue_job`, `aws_cloudtrail`, `aws_flow_log`, `aws_eks_cluster`,
+  `aws_api_gateway_integration`, `aws_cloudwatch_event_rule`,
+  `aws_sagemaker_notebook_instance`, `aws_batch_compute_environment`). The role comes from a literal ARN in the
   `role` or `role_arn` attribute, or from a reference to an `aws_iam_role`
   with a known `name`. When the plan shows that the attribute is set but not
   which role it holds, a policy with no `iam:PassRole` grant at all is
   reported missing.
+  A grant whose `iam:PassedToService` condition names another service doesn't
+  cover the resource: each type is checked against the principal that receives
+  the role (`lambda.amazonaws.com` for `aws_lambda_function`,
+  `events.amazonaws.com` for `aws_cloudwatch_event_target`, and so on). That
+  holds for the condition operators PermCheck evaluates (`ArnEquals`,
+  `ArnLike`, `StringEquals`, `StringLike`). An operator it does not model — a
+  `ForAnyValue:` or `ForAllValues:` prefix, say — is still a grant under the
+  default verdict, so a wrong-service condition written that way reads as
+  coverage; see [Policy evaluation](#policy-evaluation).
 - `iam:CreateServiceLinkedRole` is required when a create makes the service
   build its service-linked role on first use (`aws_apigatewayv2_domain_name`,
   `aws_inspector2_enabler`, `aws_cloudwatch_event_connection`, `aws_ecs_cluster`,
@@ -252,6 +264,11 @@ rather than only the action name:
   `role/aws-service-role/<service principal>/*`. AWS creates the role only
   when the account has none, so a policy without the grant can pass for a long
   time and fail on the first apply in a fresh account.
+- `secretsmanager:` actions are required on the secret a service creates for a
+  resource. An `aws_cloudwatch_event_connection` makes EventBridge create
+  `events!connection/<name>/<id>`: a create needs `CreateSecret`,
+  `GetSecretValue` and `PutSecretValue`, and an update adds `UpdateSecret`.
+  A grant on `events!connection/*` covers it.
 - PermCheck checks cross-service callbacks, such as
   `elasticloadbalancing:SetWebACL`, against the `resource_arn` of
   `aws_wafv2_web_acl_association`. The target is a literal ARN, or the

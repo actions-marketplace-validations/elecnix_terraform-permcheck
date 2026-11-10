@@ -31,6 +31,9 @@ type targeted struct {
 	// a known target, or a grant scoped elsewhere under --strict-resources,
 	// counts against the policy.
 	knownTargetsOnly bool
+	// dependsOn names the action whose dependent action this requirement is
+	// (see dependentActions). Empty for an action required on its own.
+	dependsOn string
 }
 
 // withTargets pairs each requirement with the same targets, and with the
@@ -49,6 +52,7 @@ func impliedRequirements(rc *plan.ResourceChange, set *changeSet) []targeted {
 	reqs := append(passRoleRequirements(rc, set), crossServiceRequirements(rc, set)...)
 	reqs = append(reqs, serviceLinkedRoleRequirements(rc)...)
 	reqs = append(reqs, managedSecretRequirements(rc)...)
+	reqs = append(reqs, valueRequirements(rc)...)
 	return append(reqs, instanceProfileDetachRequirements(rc, set)...)
 }
 

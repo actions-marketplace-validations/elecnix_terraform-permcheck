@@ -217,6 +217,24 @@ provider source, so PermCheck adds them explicitly:
   `[conditional: resource_arn]`. Use `--only-required` to suppress that
   over-approximation.
 
+### Dependent actions
+
+AWS authorizes a few actions only when the caller also holds a second action.
+`backup:ListRecoveryPointsByResource` fails with an "Insufficient privileges"
+error unless the caller also holds `backup:ListRecoveryPointsByBackupVault`,
+even with the first action granted on `*`. The Service Authorization Reference
+calls these pairs "dependent actions", but neither its machine-readable form
+nor its HTML pages list them, so PermCheck keeps a hand-curated table in
+`internal/iam/dependent.go`. Each row cites its evidence.
+
+Wherever PermCheck requires an action, from a resource type or from a declared
+need, it also requires that action's dependent actions, under the same gate and
+class. The finding names the action it depends on (`required with <action>` in
+the text and annotation formats, `depends_on` in JSON). The dependency acts on
+a resource the plan does not name, so it follows the rules of an action with an
+unknown target: a grant limited to some resources covers it, or is unverified
+under `--strict-resources`.
+
 ### Resource-scoped grants
 
 Some IAM grants are scoped to a specific resource ARN rather than the whole
@@ -264,6 +282,11 @@ rather than only the action name:
   `role/aws-service-role/<service principal>/*`. AWS creates the role only
   when the account has none, so a policy without the grant can pass for a long
   time and fail on the first apply in a fresh account.
+- `inspector2:ListAccountPermissions` is required for an
+  `aws_ecr_registry_scanning_configuration` whose `scan_type` is `ENHANCED`,
+  because enhanced scanning is Inspector scanning and AWS checks the action on
+  the caller. `BASIC` needs no Inspector action, and neither does a delete. A
+  `scan_type` the plan cannot show stays required.
 - `secretsmanager:` actions are required on the secret a service creates for a
   resource. An `aws_cloudwatch_event_connection` makes EventBridge create
   `events!connection/<name>/<id>`: a create needs `CreateSecret`,
@@ -696,7 +719,14 @@ data "tf-permcheck_iam_check" "deploy_role" {
 
 ## Install
 
-Download a binary for Linux, macOS or Windows from the
+Install with Homebrew on macOS or Linux. Each release publishes its cask to
+the `elecnix/tap` tap:
+
+```bash
+brew install elecnix/tap/terraform-permcheck
+```
+
+Or download a binary for Linux, macOS or Windows from the
 [releases page](https://github.com/elecnix/terraform-permcheck/releases).
 Each release lists the SHA-256 of its archives in `checksums.txt`. Or build
 from source with Go 1.26 or later:

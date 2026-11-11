@@ -1,6 +1,9 @@
 package policy
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // Coverage.
 //
@@ -121,6 +124,51 @@ func (d *Document) Coverage(action string, targets []string, conds Conditions, s
 		}
 	}
 	return Result{Verdict: Covered}
+}
+
+// CoverageOfEveryResource reports whether the policy grants action on every
+// resource, as a declared need on "*" requires.
+//
+// Only an Allow on every resource can cover every resource, so a grant
+// limited to some resources is no coverage, with or without a condition. A
+// grant on every resource whose condition the tool cannot evaluate may or may
+// not apply: it counts as coverage, and with strict set the action is
+// Unverified, as in Coverage. An unconditional Deny on every resource
+// overrides any grant.
+func (d *Document) CoverageOfEveryResource(action string, strict bool) Result {
+	granted, conditionUnknown := false, false
+	for _, s := range d.Statements {
+		if !s.matchesAction(action) {
+			continue
+		}
+		switch s.Effect {
+		case "Deny":
+			if !s.conditional() && s.deniesEveryResource() {
+				return Result{Verdict: Missing}
+			}
+		case "Allow":
+			if !s.grantsEveryResource() {
+				continue
+			}
+			switch s.conditionVerdict(nil) {
+			case condFails:
+				// The grant provably does not apply.
+			case condHolds:
+				granted = true
+			default:
+				conditionUnknown = true
+			}
+		}
+	}
+	switch {
+	case granted:
+		return Result{Verdict: Covered}
+	case conditionUnknown && strict:
+		return Result{Verdict: Unverified, Reason: ReasonCondition}
+	case conditionUnknown:
+		return Result{Verdict: Covered}
+	}
+	return Result{Verdict: Missing}
 }
 
 // grantsWithoutTarget reports what the tool concluded about the grants of an
@@ -283,4 +331,48 @@ func (d *Document) WorstVerdict(action string, targets [][]string, conds Conditi
 		}
 	}
 	return worst
+}
+
+// GrantedResources returns the Resource patterns of the Allow statements
+// that grant action, sorted and without duplicates. A statement whose
+// condition provably fails does not grant the action, and one with a
+// NotResource has no pattern to list, so neither counts.
+//
+// It returns nil when the policy grants the action on every resource, or
+// when an unconditional Deny covers every resource, or when no statement
+// grants it: a miss is then not about the grant being
+// limited to other resources, so there is nothing to name.
+func (d *Document) GrantedResources(action string) []string {
+	seen := map[string]bool{}
+	for _, s := range d.Statements {
+		if !s.matchesAction(action) {
+			continue
+		}
+		if s.Effect == "Deny" {
+			// A Deny on every resource is why the grant falls short, not
+			// the resources the grant names.
+			if !s.conditional() && s.deniesEveryResource() {
+				return nil
+			}
+			continue
+		}
+		if s.Effect != "Allow" || s.conditionVerdict(nil) == condFails {
+			continue
+		}
+		if s.grantsEveryResource() {
+			return nil
+		}
+		for _, r := range s.Resource {
+			seen[r] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for r := range seen {
+		out = append(out, r)
+	}
+	sort.Strings(out)
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

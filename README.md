@@ -526,10 +526,10 @@ config file, and PermCheck checks them against the same policy as the plan:
   on. The policy must cover each one. PermCheck uses the same resource-scoped
   check as for plan resources, so a Deny on the resource counts. `"*"` means
   the policy must grant the action on every resource, so a grant limited to
-  some resources is a gap even without `--strict-resources`. A grant whose
-  condition PermCheck cannot evaluate is not: it stays unverified under
-  `--strict-resources`, because the tool cannot prove that grant falls short
-  of every resource. Without `resources`, any
+  some resources is a gap even without `--strict-resources`, with or without
+  a condition. A grant on every resource whose condition PermCheck cannot
+  evaluate counts as covered, as for a plan resource, and
+  `--strict-resources` reports it unverified. Without `resources`, any
   grant of the action counts, as for a resource whose ARN the plan does not
   show. `--strict-resources` then reports a grant limited to some resources as
   unverified.
@@ -559,6 +559,22 @@ and its reason in parentheses:
 ```
 ::warning title=Missing IAM permission::ecr:DescribeImages needed by: needs "EcrImageVerification" on arn:aws:ecr:us-east-1:123456789012:repository/my-app (CI verifies images before deploy)
 ```
+
+When the policy grants the action, but only on resources that do not cover the
+need's resource, the finding says so and lists the resources the policy grants
+the action on, sorted. A need on `"*"` that meets a narrow grant is the usual
+case: the fix is to narrow the need to that resource.
+
+```
+  iam:CreateServiceLinkedRole [required]
+    → needs "SecurityHubAccount" on * (enable Security Hub)
+      granted only on arn:aws:iam::*:role/aws-service-role/securityhubv2.amazonaws.com/AWSServiceRoleForSecurityHubV2
+```
+
+The `github-annotations` format appends `; granted only on <resources>` to the
+need, and `json` adds a `granted_on` list to the finding. A plan resource whose
+ARN the grant does not cover gets the same detail. An action the policy does not
+grant at all keeps the plain message, with no `granted_on`.
 
 In `--format json`, the finding carries `need` and `need_resource` in place of
 `resource_type`, `resource_name` and `change`, plus the need's `reason`. A
@@ -749,7 +765,7 @@ release tag:
     terraform show -json plan.tfplan > plan.json
 
 - name: Check IAM permissions
-  uses: elecnix/terraform-permcheck@v0.9.0
+  uses: elecnix/terraform-permcheck@v0.10.2
   with:
     plan-file: plan.json
     policy-file: deploy_policy.json

@@ -83,10 +83,12 @@ func exitCode(err error) int {
 	}
 }
 
-// version is the single source of truth for the release version — bump it
-// here when tagging a release; the version test derives its expectation from
+// version is the single source of truth for the release version. Bump it in
+// its own pull request, then tag that pull request's merge commit with the
+// same value: the Release workflow refuses a tag that doesn't match. See
+// "Releasing" in AGENTS.md. The version test derives its expectation from
 // this constant.
-const version = "v0.9.2"
+const version = "v0.10.2"
 
 // usage is the top-level help text.
 const usage = `Usage: terraform-permcheck <command> [flags]

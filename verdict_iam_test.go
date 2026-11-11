@@ -103,6 +103,27 @@ func TestValidate_VerdictIAM(t *testing.T) {
 			absent:  []string{"aws_lambda_function.basic iam:PassRole"},
 		},
 		{
+			// A certificate requested by domain_name calls RequestCertificate.
+			// The provider imports only a certificate_body, so
+			// ImportCertificate is not needed.
+			name: "acm certificate requested by domain", plan: "acm_domain_plan.json", policy: "acm_policy.json",
+			present: []string{"aws_acm_certificate.web acm:RequestCertificate"},
+			absent:  []string{"aws_acm_certificate.web acm:ImportCertificate"},
+		},
+		{
+			// A certificate given as certificate_body is imported.
+			name: "acm certificate imported from a body", plan: "acm_body_plan.json", policy: "acm_policy.json",
+			present: []string{"aws_acm_certificate.imported acm:ImportCertificate"},
+			absent:  []string{"aws_acm_certificate.imported acm:RequestCertificate"},
+		},
+		{
+			// A write-only private key leaves no certificate_body trace in
+			// the plan, so private_key_wo gates the import on its own.
+			name: "acm certificate imported with a write-only key", plan: "acm_wo_plan.json", policy: "acm_policy.json",
+			present: []string{"aws_acm_certificate.imported acm:ImportCertificate"},
+			absent:  []string{"aws_acm_certificate.imported acm:RequestCertificate"},
+		},
+		{
 			// A grant on app-production-* does not reach the secret app,
 			// whose ARN ends in app- and six random characters.
 			name: "secret suffix", plan: "secret_plan.json", policy: "secret_policy.json",
@@ -117,6 +138,12 @@ func TestValidate_VerdictIAM(t *testing.T) {
 				"aws_wafv2_web_acl_association.this apigateway:SetWebACL",
 				"aws_wafv2_web_acl_association.this appsync:SetWebACL",
 			},
+		},
+		{
+			// A StringLike grant limited to Lambda does not cover a role
+			// that an event target passes to EventBridge.
+			name: "StringLike passed-to-service", plan: "passedtoservice_like_plan.json", policy: "passedtoservice_like_policy.json",
+			present: []string{"aws_cloudwatch_event_target.run iam:PassRole"},
 		},
 		{
 			// A PassRole grant on role/myapp does not reach the role app.

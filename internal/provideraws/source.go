@@ -23,7 +23,7 @@ var sdkResourceAnnotationRE = regexp.MustCompile(`@SDKResource\("(aws_[^",]+)[",
 
 // DefaultProviderRef is the pinned provider version used for parsing.
 // This is the framework-refactored codebase (v5+).
-const DefaultProviderRef = "v5.90.0"
+const DefaultProviderRef = "v6.72.0"
 
 // SourceProvider resolves AWS resource types by parsing the terraform-provider-aws
 // Go source code to extract the exact SDK API calls made by each resource.
@@ -206,12 +206,12 @@ func parseResources(repoPath string) ([]resourceFile, error) {
 // resourceFile is one resource found in a service package, with what pass 2
 // needs to build its schema.
 type resourceFile struct {
-	pkg        *Package
-	tfType     string
-	funcs      map[string][]string // operation → bound functions
-	tagged     bool                // the file carries a @Tags annotation
-	tagActions TagActions          // the service's transparent tagging actions
-	framework  bool                // a @FrameworkResource, whose operations are methods
+	pkg       *Package
+	tfType    string
+	funcs     map[string][]string // operation → bound functions
+	tagged    bool                // the file carries a @Tags annotation
+	tags      tagEntries          // the functions that tag it, when tagged
+	framework bool                // a @FrameworkResource, whose operations are methods
 }
 
 // indexService parses every non-test Go file of one service directory as a
@@ -245,12 +245,6 @@ func indexService(svcDir, serviceName string) (*Package, []resourceFile) {
 	}
 	pkg := newPackage(parsed)
 
-	// Transparent tagging actions (e.g. kms:TagResource) live in the
-	// service's generated tags_gen.go, not in each resource's CRUD
-	// functions. Parse them once per service and attach to taggable
-	// resources.
-	tagActions := tagActionsForService(svcDir)
-
 	names := make([]string, 0, len(parsed))
 	for name := range parsed {
 		names = append(names, name)
@@ -264,51 +258,49 @@ func indexService(svcDir, serviceName string) (*Package, []resourceFile) {
 		if tfType := frameworkResourceType(string(src)); tfType != "" {
 			if typeName := frameworkResourceStruct(parsed[name]); typeName != "" {
 				found = append(found, resourceFile{
-					pkg:        pkg,
-					tfType:     tfType,
-					funcs:      pkg.frameworkFuncs(typeName),
-					tagged:     hasTagsAnnotation(src),
-					tagActions: tagActions,
-					framework:  true,
+					pkg:       pkg,
+					tfType:    tfType,
+					funcs:     pkg.frameworkFuncs(typeName),
+					tagged:    hasTagsAnnotation(src),
+					tags:      pkg.tagEntriesFor(tagsResourceType(src)),
+					framework: true,
 				})
 			}
 			continue
 		}
-		// Prefer the @SDKResource annotation (canonical), fall back to
-		// file-path derivation.
-		tfType := resourceTypeFromAnnotation(src)
-		if tfType == "" {
-			tfType = resourceTypeFromFile(serviceName, name)
+		// Prefer the @SDKResource annotations (canonical), fall back to
+		// file-path derivation. A file that declares its resource under
+		// several names, such as aws_alb_listener and aws_lb_listener,
+		// yields one resource per name, all bound to the same functions.
+		tfTypes := resourceTypesFromAnnotation(src)
+		if len(tfTypes) == 0 {
+			tfTypes = []string{resourceTypeFromFile(serviceName, name)}
 		}
+		// A resource names its operations by suffix (resourceVaultCreate)
+		// or binds them in its schema.Resource literal. Only a literal that
+		// binds a create function makes a file without a ...Create or
+		// ...Delete function a resource; a data source binds only a read.
+		// A create bound to a method (h.Upsert) names no function to follow,
+		// so such a file stays unresolved rather than get an empty entry.
 		resourceName := resourceNameFromFile(parsed[name])
-		if tfType == "" || resourceName == "" {
-			continue
+		if resourceName == "" {
+			if create := operationBindings(parsed[name])["create"]; len(create) == 0 || create[0] == "" {
+				continue
+			}
 		}
-		found = append(found, resourceFile{
-			pkg:        pkg,
-			tfType:     tfType,
-			funcs:      pkg.resourceFuncs(name, resourceName),
-			tagged:     hasTagsAnnotation(src),
-			tagActions: tagActions,
-		})
+		funcs := pkg.resourceFuncs(name, resourceName)
+		for _, tfType := range tfTypes {
+			found = append(found, resourceFile{
+				pkg:    pkg,
+				tfType: tfType,
+				funcs:  funcs,
+				tagged: hasTagsAnnotation(src),
+				tags:   pkg.tagEntriesFor(tagsResourceType(src)),
+			})
+		}
 	}
 	pkg.files = nil
 	return pkg, found
-}
-
-// tagActionsForService reads a service directory's generated tags_gen.go (if
-// present) and extracts its transparent-tagging SDK actions. Returns an empty
-// TagActions when the file is absent or yields no tagging calls.
-func tagActionsForService(svcDir string) TagActions {
-	src, err := os.ReadFile(filepath.Join(svcDir, "tags_gen.go"))
-	if err != nil {
-		return TagActions{}
-	}
-	ta, err := ExtractTagActions(string(src))
-	if err != nil {
-		return TagActions{}
-	}
-	return ta
 }
 
 // schema builds the iam.Schema of one resource.
@@ -334,17 +326,24 @@ func (r resourceFile) schema() *iam.Schema {
 	// provider makes additional SDK tagging calls when `tags` is set — calls
 	// that don't appear in the resource's own CRUD functions. Add them as
 	// permissions gated on the `tags` attribute.
-	if r.tagged && !r.tagActions.Empty() {
-		addTagActions(schema, "create", r.tagActions.Apply)
-		addTagActions(schema, "update", r.tagActions.Apply)
-		addTagActions(schema, "update", r.tagActions.Remove)
+	// The tagging functions may live in any file of the package, such as a
+	// hand-written tags.go, and call helpers such as a paging function in
+	// list_pages.go.
+	tagActions := TagActions{}
+	if r.tagged {
+		tagActions = r.pkg.tagActions(r.tags)
+	}
+	if !tagActions.Empty() {
+		addTagActions(schema, "create", tagActions.Apply)
+		addTagActions(schema, "update", tagActions.Apply)
+		addTagActions(schema, "update", tagActions.Remove)
 
 		// The list-tags SDK call (e.g. kms:ListResourceTags) is made
 		// unconditionally on every resource Read for @Tags-annotated
 		// resources, and Create returns Read — so it's needed on both
 		// read and create without any attribute gating.
-		addUnconditionalActions(schema, "read", r.tagActions.List)
-		addUnconditionalActions(schema, "create", r.tagActions.List)
+		addUnconditionalActions(schema, "read", tagActions.List)
+		addUnconditionalActions(schema, "create", tagActions.List)
 	}
 
 	applyCorrections(schema)
@@ -391,9 +390,11 @@ type schemaGate struct {
 	gate   iam.Gate
 }
 
-// schemaGates is the list of parser under-specifications. Each entry replaces
-// the gate of every path on which one operation reaches one action, on one
-// resource type. No entry re-adds an action the parser left out; that is what
+// schemaGates is the list of parser under-specifications. The entries for one
+// operation, action and resource type replace every path on which that
+// operation reaches the action: each entry becomes one path, in the order
+// listed. Several entries give an action that runs on any of several
+// attributes. No entry re-adds an action the parser left out; that is what
 // schemaCorrections does.
 var schemaGates = []schemaGate{
 	// resourceRoleCreate, resourceRoleUpdate and resourceRoleRead all end in
@@ -406,6 +407,22 @@ var schemaGates = []schemaGate{
 	{tfType: "aws_iam_role", op: "create", action: "iam:GetRolePolicy", gate: iam.Gate{Attribute: "inline_policy", ValueGuarded: true}},
 	{tfType: "aws_iam_role", op: "update", action: "iam:GetRolePolicy", gate: iam.Gate{Attribute: "inline_policy", ValueGuarded: true}},
 	{tfType: "aws_iam_role", op: "read", action: "iam:GetRolePolicy", gate: iam.Gate{Attribute: "inline_policy", ValueGuarded: true}},
+
+	// resourceCertificateCreate calls RequestCertificate when the
+	// configuration sets domain_name, and ImportCertificate in the else
+	// branch. Schema rules keep the two apart: domain_name conflicts with
+	// certificate_body and private_key_wo. The else branch tests no
+	// attribute, so the parser lists the import ungated and every requested
+	// certificate reports it. The import runs when the author gives a
+	// certificate_body. certificate_body is not sensitive, unlike private_key,
+	// whose value the plan may withhold. private_key_wo is write-only, so a
+	// certificate imported through it has no certificate_body to key on, and
+	// its planned value is always null, so a presence gate on the plan state
+	// would never hold. Both paths are value guards: a value guard holds when
+	// the plan's configuration section sets the attribute, which a write-only
+	// attribute does.
+	{tfType: "aws_acm_certificate", op: "create", action: "acm:ImportCertificate", gate: iam.Gate{Attribute: "certificate_body", ValueGuarded: true}},
+	{tfType: "aws_acm_certificate", op: "create", action: "acm:ImportCertificate", gate: iam.Gate{Attribute: "private_key_wo", ValueGuarded: true}},
 }
 
 // applySchemaGates replaces the gate of the paths listed in schemaGates. Like
@@ -413,29 +430,43 @@ var schemaGates = []schemaGate{
 // requirements are assembled, so it takes effect whatever path added the
 // action.
 func applySchemaGates(schema *iam.Schema) {
+	type target struct{ op, action string }
+	gates := make(map[target][]iam.Gate)
+	var order []target
 	for _, g := range schemaGates {
 		if g.tfType != schema.TypeName {
 			continue
 		}
-		reqs, ok := schema.Ops[g.op]
+		t := target{g.op, g.action}
+		if _, seen := gates[t]; !seen {
+			order = append(order, t)
+		}
+		gates[t] = append(gates[t], g.gate)
+	}
+	for _, t := range order {
+		reqs, ok := schema.Ops[t.op]
 		if !ok {
 			continue
 		}
-		out := make([]iam.Requirement, len(reqs))
-		copy(out, reqs)
-		changed := false
-		for i, r := range out {
-			if r.Action != g.action {
+		out := make([]iam.Requirement, 0, len(reqs)+len(gates[t]))
+		emitted, changed := false, false
+		for _, r := range reqs {
+			if r.Action != t.action {
+				out = append(out, r)
 				continue
 			}
-			if out[i].Gate == g.gate {
+			if emitted {
+				changed = true
 				continue
 			}
-			out[i].Gate = g.gate
-			changed = true
+			emitted = true
+			for _, gate := range gates[t] {
+				out = append(out, iam.Requirement{Action: t.action, Gate: gate})
+			}
+			changed = changed || len(gates[t]) != 1 || r.Gate != gates[t][0]
 		}
 		if changed {
-			schema.Ops[g.op] = out
+			schema.Ops[t.op] = out
 		}
 	}
 }
@@ -524,19 +555,20 @@ func setGates(schema *iam.Schema, op, action string, gates []iam.Gate) {
 	schema.Ops[op] = out
 }
 
-// resourceTypeFromAnnotation extracts the terraform resource type from an
-// @SDKResource annotation in the Go source code.
+// resourceTypesFromAnnotation extracts the terraform resource types from the
+// @SDKResource annotations in the Go source code, in source order. A file
+// may declare its resource under a deprecated name and its current one:
 //
-//	// @SDKResource("aws_instance", name="Instance")
-//	// @SDKResource("aws_cloudwatch_log_group", name="Log Group")
+//	// @SDKResource("aws_alb_listener", name="Listener")
+//	// @SDKResource("aws_lb_listener", name="Listener")
 //
-// Returns empty string if no annotation is found.
-func resourceTypeFromAnnotation(src []byte) string {
-	matches := sdkResourceAnnotationRE.FindSubmatch(src)
-	if len(matches) >= 2 {
-		return string(matches[1])
+// Returns nil if no annotation is found.
+func resourceTypesFromAnnotation(src []byte) []string {
+	var types []string
+	for _, m := range sdkResourceAnnotationRE.FindAllSubmatch(src, -1) {
+		types = append(types, string(m[1]))
 	}
-	return ""
+	return types
 }
 
 // resourceTypeFromFile derives the terraform resource type from the file path.

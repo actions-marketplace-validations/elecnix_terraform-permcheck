@@ -1436,3 +1436,72 @@ func TestValidate_LBListenerForwardNeedsNoCognito(t *testing.T) {
 		t.Errorf("report names a Cognito action for a forward listener:\n%s", out)
 	}
 }
+
+// TestValidate_StarNeedUnderUnevaluableCondition runs the repro of issue 191:
+// a need on "*" whose grant carries a condition on a key the plan never
+// supplies. The default run counts it as covered, as for a resource change,
+// and --strict-resources reports it unverified.
+func TestValidate_StarNeedUnderUnevaluableCondition(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := dir + "/" + name
+		if err := os.WriteFile(p, []byte(body), 0644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+	args := []string{"validate", "--cloud", "aws",
+		"--plan-file", write("plan.json", `{"format_version":"1.2","terraform_version":"1.9.0","resource_changes":[]}`),
+		"--policy-file", write("policy.json", `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["guardduty:GetDetector"],"Resource":"*","Condition":{"StringEquals":{"aws:RequestedRegion":"ca-central-1"}}}]}`),
+		"--config", writeConfig(t, dir, `{"needs":[{"sid":"N","actions":["guardduty:GetDetector"],"resources":["*"],"reason":"probe"}]}`),
+	}
+
+	var runErr error
+	out := captureStdout(t, func() { runErr = run(args) })
+	if runErr != nil {
+		t.Fatalf("expected nil without --strict-resources, got %v\n%s", runErr, out)
+	}
+	if !strings.Contains(out, "All required permissions covered (0 resource changes, 1 declared need checked)") {
+		t.Errorf("expected all-clear, got %s", out)
+	}
+
+	out = captureStdout(t, func() { runErr = run(append(args, "--strict-resources", "--format", "json")) })
+	if !errors.Is(runErr, errGapsFound) {
+		t.Fatalf("expected errGapsFound under --strict-resources, got %v", runErr)
+	}
+	var result report.JSONResult
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out)
+	}
+	if len(result.Missing) != 1 || result.Missing[0].Unverified != "condition" || result.Missing[0].Need != "N" {
+		t.Errorf("want one unverified (condition) finding for need N, got %+v", result.Missing)
+	}
+}
+
+// TestValidate_IAMRoleTagsNeedOnlyRoleTagActions runs the repro of issue 190:
+// a tag change on an aws_iam_role needs iam:TagRole and iam:UntagRole, not
+// the tag actions of every IAM resource type.
+func TestValidate_IAMRoleTagsNeedOnlyRoleTagActions(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := dir + "/" + name
+		if err := os.WriteFile(p, []byte(body), 0644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+	args := []string{"validate", "--cloud", "aws",
+		"--plan-file", write("plan.json", `{"format_version":"1.2","terraform_version":"1.9.0","resource_changes":[
+{"address":"aws_iam_role.r","mode":"managed","type":"aws_iam_role","name":"r","provider_name":"registry.terraform.io/hashicorp/aws","change":{"actions":["update"],"before":{"name":"r","tags":{"a":"b"}},"after":{"name":"r","tags":{"a":"c"}},"after_unknown":{}}}]}`),
+		"--policy-file", write("policy.json", `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["iam:TagRole","iam:UntagRole","iam:GetRole","iam:GetRolePolicy","iam:UpdateRole","iam:ListRoleTags","iam:UpdateAssumeRolePolicy","iam:ListAttachedRolePolicies","iam:ListRolePolicies"],"Resource":"*"}]}`),
+		"--config", writeConfig(t, dir, `{}`),
+	}
+	var runErr error
+	out := captureStdout(t, func() { runErr = run(args) })
+	if runErr != nil {
+		t.Fatalf("expected nil, got %v\n%s", runErr, out)
+	}
+	if !strings.Contains(out, "All required permissions covered") {
+		t.Errorf("expected all-clear, got %s", out)
+	}
+}

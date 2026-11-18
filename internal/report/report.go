@@ -112,13 +112,21 @@ type Report struct {
 	// hasGaps reports that the result fails the run. It sets the json
 	// status.
 	hasGaps bool
+
+	// principals are the mapped principals the run checked, with the
+	// policy sources that may apply to their needs.
+	principals []check.PrincipalSources
+	// resourcesSkipped reports that the run checked mapped needs only,
+	// without a --policy-* source.
+	resourcesSkipped bool
 }
 
 // New builds the report of res. locations gives the file and line of each
 // resource block; it may be nil. Excluded findings appear in the report only
 // when showExcluded is set.
 func New(res check.Result, locations Locations, showExcluded bool) *Report {
-	r := &Report{checked: res.Checked, label: res.Label, needs: res.Needs, unresolvedAllowed: res.UnresolvedAllowed, hasGaps: res.HasGaps()}
+	r := &Report{checked: res.Checked, label: res.Label, needs: res.Needs, unresolvedAllowed: res.UnresolvedAllowed, hasGaps: res.HasGaps(),
+		principals: res.Principals, resourcesSkipped: res.PlanResourcesSkipped}
 	locate := func(m iam.MissingAction) finding {
 		f := finding{MissingAction: m}
 		if loc, ok := locations.Of(m); ok {
@@ -166,7 +174,14 @@ func New(res check.Result, locations Locations, showExcluded bool) *Report {
 // all-clear line to stdout. A report with an unresolved resource type never
 // prints the all-clear line, even when the type is allowed or excluded: the
 // tool did not check that type.
+//
+// Every format but json starts stderr with the notices of a run with mapped
+// principals (see notices). The json report carries the same facts in its
+// policy_sources and plan_resources_skipped keys.
 func (r *Report) Write(f Format, stdout, stderr io.Writer) {
+	if f != JSON {
+		fmt.Fprint(stderr, r.notices())
+	}
 	switch f {
 	case JSON:
 		fmt.Fprint(stdout, r.json())
@@ -328,6 +343,9 @@ func source(m iam.MissingAction) string {
 		s = fmt.Sprintf("%s (%s)", m.Address(), m.Change)
 	} else {
 		s = fmt.Sprintf("needs %q", m.Need)
+		if m.Principal != "" {
+			s += " of " + m.Principal
+		}
 		if m.NeedResource != "" {
 			s += " on " + m.NeedResource
 		}
@@ -349,6 +367,16 @@ func grantNote(m iam.MissingAction) string {
 		return ""
 	}
 	return "granted only on " + strings.Join(m.GrantedOn, ", ")
+}
+
+// boundaryNote says which permissions boundary makes the finding's action
+// missing while the principal's other policies allow it. It is empty for a
+// finding that no boundary causes.
+func boundaryNote(m iam.MissingAction) string {
+	if m.Boundary == "" {
+		return ""
+	}
+	return "not allowed by the permissions boundary " + m.Boundary
 }
 
 // classTag is the tag of a permission class in every format. The json
@@ -375,14 +403,19 @@ func (f finding) unverifiedReason() iam.UnverifiedReason {
 		return iam.ReasonCondition
 	case f.ResourceScopeUnverified:
 		return iam.ReasonResourceScope
+	case f.PolicyUnknownUnverified:
+		return iam.ReasonPolicyUnknown
+	case f.CrossAccountUnverified:
+		return iam.ReasonCrossAccount
 	default:
 		return iam.ReasonNone
 	}
 }
 
 // unverifiedTag marks a finding whose coverage depends on a grant the tool
-// cannot check: a resource scope it cannot derive, or a condition it cannot
-// evaluate (--strict-resources).
+// cannot check: a resource scope it cannot derive, a condition it cannot
+// evaluate, a policy source whose text the plan does not show, or a resource
+// policy in another account (--strict-resources).
 func unverifiedTag(reason iam.UnverifiedReason) string {
 	if reason == iam.ReasonNone {
 		return ""

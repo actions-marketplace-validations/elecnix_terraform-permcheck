@@ -412,8 +412,13 @@ ARN, and a value computed at apply time is absent from the plan.
 denies every action outside its list. A `NotResource` grant covers any target
 outside its list, and doesn't cover a target that a listed pattern contains.
 
-Permission boundaries, service control policies, session policies and
-resource-based policies are out of scope.
+The check of the plan's resources against the `--policy-*` document leaves
+out permissions boundaries, resource-based policies, service control
+policies, resource control policies and session policies. The needs of a
+mapped role or user also read its permissions boundary and the resource
+policies of the plan, and they still count service control policies,
+resource control policies and session policies as allowing (see
+[Needs of a role or user in the plan](#needs-of-a-role-or-user-in-the-plan)).
 
 ### Excluding known false positives
 
@@ -461,6 +466,12 @@ directory, or pointed at with `--config`):
   - the address without `count` and `for_each` keys, so `aws_s3_bucket.logs`
     matches `aws_s3_bucket.logs[0]` and `module.app.aws_s3_bucket.logs`
     matches `module.app["eu"].aws_s3_bucket.logs`.
+  - for a declared need, `needs.<sid>`. A run without `--principal` checks
+    the needs of every mapped principal, and two of them may use the same
+    sid. `needs.<sid>` matches that sid for each principal. The need of a
+    mapped principal also matches `needs.<label>.<sid>`, so
+    `needs.deploy.Read` hides the `Read` need of `deploy` and keeps the `Read`
+    need of `task`.
 - **`operations`** (optional) — limits the exclusion to the named terraform
   operations: `create`, `update`, `delete`, or `read`. Omit to apply the
   exclusion to every operation.
@@ -535,10 +546,15 @@ config file, and PermCheck checks them against the same policy as the plan:
   grant of the action counts, as for a resource whose ARN the plan does not
   show. `--strict-resources` then reports a grant limited to some resources as
   unverified.
-- **`principal`** (optional) names the role the need belongs to. PermCheck
-  checks one policy per run, so a need with a principal applies only when
-  `--principal` names it. A need without a principal applies on every run.
-  An unknown `--principal` value is an error.
+- **`principal`** (optional) is a label for the role or user the need belongs
+  to. A need without a principal applies on every run. The `--policy-*`
+  document is the policy of one principal, so a need with a label outside the
+  `principals` map applies only when `--principal` selects it. An unknown
+  `--principal` value is an error. When the `principals` map of the config
+  gives the label a role or a user, the need is a mapped need. PermCheck
+  checks it against that role's or user's policies in the plan, and a run
+  without `--principal` checks it too (see
+  [Needs of a role or user in the plan](#needs-of-a-role-or-user-in-the-plan)).
 - **`reason`** (optional) is a note for reviewers. PermCheck shows it with
   every finding the need produces: in the `text` and `github-annotations`
   formats it follows the need in parentheses, and in `json` it is the
@@ -582,10 +598,540 @@ In `--format json`, the finding carries `need` and `need_resource` in place of
 `resource_type`, `resource_name` and `change`, plus the need's `reason`. A
 missing need fails the run unless `--exit-zero` is set. An exclusion can
 suppress it: its `permission` matches the action, and its `resource` matches
-`needs.<sid>`.
+`needs.<sid>`. For the need of a mapped principal, it also matches
+`needs.<label>.<sid>` (see
+[Excluding known false positives](#excluding-known-false-positives)).
 
-PermCheck checks the needs against the one policy it is given. It does not
-collect the other policies in the plan or evaluate resource-based policies.
+Without a `principals` map, PermCheck checks the needs against the one
+`--policy-*` document it's given. With the map, it checks the needs of a
+mapped role or user against the policies of the plan (see
+[Needs of a role or user in the plan](#needs-of-a-role-or-user-in-the-plan)).
+
+#### Needs of a role or user in the plan
+
+A role or a user that the plan creates gets its permissions from the policies
+the plan attaches to it. The `principals` map of the config file gives a
+need's `principal` label that role or user. PermCheck then checks the need
+against the role's or user's policies in the plan, its permissions boundary,
+and the resource policies of the need's resource. It doesn't use the
+`--policy-*` document for that need:
+
+```json
+{
+  "principals": { "task": { "address": "aws_iam_role.task" } },
+  "needs": [
+    {
+      "sid": "FetchSecrets",
+      "principal": "task",
+      "actions": ["secretsmanager:GetSecretValue"],
+      "resources": ["arn:aws:secretsmanager:us-east-1:123456789012:secret:app-db-*"]
+    }
+  ]
+}
+```
+
+```bash
+terraform-permcheck validate --plan-file plan.json --cloud aws
+```
+
+The diagram shows how PermCheck reaches the verdict of a mapped need in one
+account:
+
+```mermaid
+flowchart LR
+  need["Need: actions on a resource"] --> principal["Mapped role or user"]
+  principal --> identity["Identity policies"]
+  principal --> boundary["Permissions boundary"]
+  need --> resource["Resource policies of the need's resource"]
+  identity -->|"any Allow grants, a definite Deny overrides"| verdict{"Verdict"}
+  resource -->|"any Allow grants, a definite Deny overrides"| verdict
+  boundary -->|"must also allow"| verdict
+  unknown["Unknown source"] -->|"may grant"| verdict
+  verdict -->|"a policy grants it"| covered["Covered"]
+  verdict -->|"only an unknown source may grant it"| unverified["Unverified under --strict-resources, covered by default"]
+  verdict -->|"no grant, or a definite Deny"| missing["Missing"]
+```
+
+The diagram leaves out two rules. A need on a KMS key or on a resource in
+another account needs an `Allow` on both sides. Service control policies,
+resource control policies and session policies count as allowing, since
+PermCheck doesn't evaluate them (see
+[Assumptions and limits](#assumptions-and-limits)).
+
+##### The `principals` map
+
+Each value of the map sets exactly one of `address`, `name` and `arn`. For a
+role or user that the plan creates or keeps, `address` is the terraform
+instance address of its `aws_iam_role` or `aws_iam_user`, as
+`terraform show -json` prints it. For a role or user outside the plan, such as
+one that another stack creates, set `name` or `arn` instead:
+
+```json
+{ "principals": { "ops": { "name": "ops-admin" } } }
+{ "principals": { "ops": { "arn": "arn:aws:iam::123456789012:role/ops-admin" } } }
+{ "principals": { "ci": { "arn": "arn:aws:iam::123456789012:user/ci" } } }
+{ "principals": { "ci": { "name": "ci", "type": "user" } } }
+```
+
+An `arn` must be the ARN of an IAM role or user, without a wildcard. PermCheck
+reads the name from the last part of the ARN's path.
+
+The resources of a plan give a role or user by its name, such as the `role` of
+an `aws_iam_role_policy`. The provider looks the name up in the account of its
+credentials, and the plan doesn't show that account. A `name` entry is a role
+or user of that account, so a resource with the same name attaches to it. For
+an `arn` entry, the same name may be a role or user of another account. Its
+policies then count as grants PermCheck can't check, with the reason
+`condition`, and PermCheck ignores their `Deny` statements. The exclusive
+resources don't make the plan list every policy of an `arn` entry either. Use a
+`name` entry for a role or user in the account that the plan runs in. A name alone doesn't say
+whether it's a role or a user, so a `name` entry is a role unless it sets
+`"type": "user"`. The optional `type` is `role` or `user`. An `address` or an
+`arn` already gives the kind.
+
+A need whose label is a key of the map is a mapped need. Without
+`--principal`, a run checks the needs of every mapped principal and the needs
+without a principal. `--principal NAME` checks the needs labelled NAME and the
+needs without a principal, as before. A label that isn't in the map runs only
+when `--principal` selects it, and PermCheck checks it against the
+`--policy-*` document.
+
+A run whose selected needs are all mapped works without a `--policy-*` source.
+It checks those needs and skips the plan's resources, and a notice on stderr
+says so. Its `json` report has `"plan_resources_skipped": true`. A run without
+a `--policy-*` source that selects an unmapped need fails as before.
+
+A run fails with exit code 2 in these cases:
+
+- A key of the map isn't the label of a need.
+- An `address` isn't the address of an `aws_iam_role` or an `aws_iam_user`,
+  such as the address of an `aws_iam_group`.
+- An `address` matches no resource change in the plan.
+- A `type` differs from the kind that the `address` or the `arn` gives.
+- A role or user of the plan has the known name or ARN that the entry gives.
+  The error gives its address to use instead, so each role or user in the plan
+  has one entry form.
+- The run is in static HCL mode, which has no plan, and selects a mapped need.
+
+Releases from v0.11.0 on read `principals`. An older release ignores the key and
+checks every need against the `--policy-*` document.
+
+##### Policies PermCheck reads
+
+A mapped principal's identity policies come from these resources:
+
+| Principal | Inline policies | Managed policies |
+|-----------|-----------------|------------------|
+| Role | `aws_iam_role_policy`, the `inline_policy` blocks of `aws_iam_role` | `aws_iam_role_policy_attachment`, the `roles` of `aws_iam_policy_attachment`, the `managed_policy_arns` of `aws_iam_role`, the `policy_arns` of `aws_iam_role_policy_attachments_exclusive` |
+| User | `aws_iam_user_policy` | `aws_iam_user_policy_attachment`, the `users` of `aws_iam_policy_attachment`, the `policy_arns` of `aws_iam_user_policy_attachments_exclusive` |
+| Group of a user | `aws_iam_group_policy` | `aws_iam_group_policy_attachment`, the `groups` of `aws_iam_policy_attachment`, the `policy_arns` of `aws_iam_group_policy_attachments_exclusive` |
+
+A user gets the policies of each group it belongs to: "For an IAM user, these
+include user policies and policies from groups to which the user belongs"
+([how AWS enforcement code logic evaluates requests](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic_policy-eval-denyallow.html)).
+The plan puts a user in a group with `aws_iam_user_group_membership` (`user`
+and `groups`) or `aws_iam_group_membership` (`group` and `users`). A group
+policy applies to the user through two links: from the policy to the group,
+then from a membership to the user. PermCheck decides each link as it decides
+the link of a role's policy. The policy applies when both links apply, it
+doesn't apply when either link doesn't, and PermCheck can't decide it
+otherwise.
+
+PermCheck finds the text of an attached managed policy in an `aws_iam_policy`
+of the plan. The attachment's references decide first, as in
+`policy_arn = aws_iam_policy.deploy.arn`. Then its known ARN must equal the
+known `arn` of an `aws_iam_policy`. An AWS managed policy, or a policy that
+another stack creates, isn't in the plan. To give PermCheck its text, add a
+data source with the same ARN:
+
+```hcl
+data "aws_iam_policy" "ecr_power_user" {
+  arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser"
+}
+```
+
+Terraform reads a data source during the plan when it knows every argument
+and no dependency has a pending change. `terraform show -json` then records
+the data source's values in `prior_state`, and PermCheck reads the `policy`
+attribute from there. When terraform defers the read to the apply, the policy
+text stays unknown.
+
+The `permissions_boundary` of an `aws_iam_role` or an `aws_iam_user` is a
+policy ARN. PermCheck finds its text as it finds the text of an attached
+managed policy.
+
+PermCheck reads the resource policies of a service only after the service's
+documentation confirms how they combine with identity policies:
+
+| Service | Resource types | Documentation |
+|---------|----------------|---------------|
+| Secrets Manager | `aws_secretsmanager_secret_policy`, the `policy` of `aws_secretsmanager_secret` | [Resource-based policies](https://docs.aws.amazon.com/secretsmanager/latest/userguide/auth-and-access_resource-policies.html) |
+| S3 | `aws_s3_bucket_policy`, the deprecated `policy` of `aws_s3_bucket` | [Authorizing an object operation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-auth-workflow-object-operation.html) |
+| SQS | `aws_sqs_queue_policy`, the `policy` of `aws_sqs_queue` | [Using Amazon SQS and IAM policies](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-using-identity-based-policies.html#sqs-using-sqs-and-iam-policies) |
+| SNS | `aws_sns_topic_policy`, the `policy` of `aws_sns_topic` | [IAM and Amazon SNS policies together](https://docs.aws.amazon.com/sns/latest/dg/sns-using-identity-based-policies.html#iam-and-sns-policies) |
+| ECR | `aws_ecr_repository_policy` | [Repository policies vs IAM policies](https://docs.aws.amazon.com/AmazonECR/latest/userguide/repository-policies.html#repository-policy-vs-iam-policy) |
+| KMS | the `policy` of `aws_kms_key`, `aws_kms_key_policy`, `aws_kms_grant`, and `aws_kms_alias` to find a key from an alias | [Key policies](https://docs.aws.amazon.com/kms/latest/developerguide/key-policies.html), [grants](https://docs.aws.amazon.com/kms/latest/developerguide/grants.html) |
+
+The `policy` attribute of a resource such as `aws_sqs_queue` is a source only
+when the configuration writes it. When the configuration leaves it out, the
+attribute shows a policy that another resource sets, or AWS's default.
+
+##### Rules for a verdict
+
+In one account, AWS allows a request when an identity policy or a resource
+policy allows it, and an explicit deny in either overrides the allow
+([policy evaluation logic](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html#policy-eval-basics-id-rdp)).
+PermCheck merges the identity policies and the resource policies that apply to
+the need, and checks the need against the result. Any `Allow` grants, and a
+definite `Deny` overrides it. The IAM guide adds that some services may also
+require an `Allow` in the resource policy. So PermCheck reads a service's
+resource policies only after its documentation confirms the rule.
+
+A resource policy applies to a need when its resource may be the need's
+resource. The link attribute of the policy resource, such as `secret_arn` or
+`bucket`, refers to the resource by reference or by a known value, such as an
+ARN or a queue URL. PermCheck compares the need's ARN with the resource's
+`arn` when the plan knows it. Otherwise it compares the need's ARN with a
+pattern built from the resource's name, such as a secret's name followed by
+the six random characters that AWS appends. When the plan shows neither, the
+resource may be the need's resource. The policy's `Allow` statements then
+count as grants PermCheck can't check, with the reason `resource_scope`, and
+PermCheck ignores its `Deny` statements. A need without `resources` may act on
+any resource of the service, so each of its resource policies applies. A need
+on `"*"` needs a grant on every resource. The policy of one resource can't
+give that, so PermCheck checks such a need against the identity policies
+alone.
+
+A statement of a resource policy applies to its own resource only, even when
+its `Resource` is `"*"`. PermCheck replaces that `"*"` with the resource's ARN,
+or with the name pattern when terraform computes the ARN at apply time. A
+statement whose `Resource` refers to part of the resource keeps it, and a
+statement on another resource grants nothing. A bucket policy covers the
+bucket and its objects. A statement on `arn:aws:s3:::app-data` grants on the
+bucket only, so it doesn't give `s3:GetObject` on `arn:aws:s3:::app-data/*`.
+A statement on `arn:aws:s3:::app-data/*` grants on the objects only, so it
+doesn't give `s3:ListBucket` on the bucket. PermCheck assumes that the
+bucket's account is the owner of each object in it, as the bucket owner
+enforced setting of Object Ownership guarantees. An object whose owner is
+another account also needs a grant in the object's ACL.
+
+The `Principal` element of a statement says whom it applies to
+([Principal element](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_principal.html)).
+Identity policies don't use it. An `Allow` in a resource policy grants the
+role when its `Principal` is `"*"` or the role's ARN. When the plan creates
+the role, its account is unknown, so an ARN with the role's name may grant
+it. PermCheck then counts the need as covered by default, and reports it
+unverified under `--strict-resources` with the reason `condition`. An account
+principal, such as `arn:aws:iam::123456789012:root`, hands the decision to the
+account's IAM policies and grants the role nothing by itself. A `Deny` counts
+when its `Principal` is `"*"`, the role's ARN or the role's account, or when
+its `NotPrincipal` list can't exclude the role.
+
+AWS gives a new SNS topic a default policy. It allows `"AWS": "*"` only when
+the condition key `AWS:SourceOwner` equals the topic owner's account. The SNS
+guide says that some AWS services set that key when they publish to a topic
+on behalf of an account
+([`aws:SourceAccount` versus `aws:SourceOwner`](https://docs.aws.amazon.com/sns/latest/dg/sns-access-policy-use-cases.html#source-account-versus-source-owner)).
+A role's own call doesn't set it, so the default policy grants the role
+nothing. PermCheck reads a topic without a configured policy as a topic with
+an empty policy, and checks the need against the identity policies alone, as
+AWS does.
+
+###### Permissions boundaries
+
+The identity policies and the boundary give "the intersection of the two
+categories"
+([evaluating identity-based policies with permissions boundaries](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html#policy-eval-basics-id-bound)).
+PermCheck checks each need against the boundary on its own. When the boundary
+doesn't allow the action, or denies it, the need is missing, even when an
+identity policy grants it. The finding then gives the boundary:
+
+```
+  s3:GetObject [required]
+    → needs "ReadData" of task on arn:aws:s3:::app-data/report.csv
+      not allowed by the permissions boundary aws_iam_policy.logs_only
+```
+
+The `github-annotations` format appends `; not allowed by the permissions
+boundary <name>` to the need, and the `json` entry adds `boundary`. The name is
+the address of the `aws_iam_policy` or `data "aws_iam_policy"` that has the
+boundary's text.
+
+A boundary also limits a resource policy statement that grants the role's
+ARN. It doesn't limit a statement that grants a session of the role, or one
+that grants an IAM user's ARN
+([how AWS enforcement code logic evaluates requests](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic_policy-eval-denyallow.html),
+[permissions boundaries](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_boundaries.html)).
+A statement that grants a user's ARN covers the user's need, even when the
+boundary doesn't allow it. PermCheck can't tell whether the session in a
+session grant makes the request. So a need that a session grant covers, and
+the boundary doesn't allow, is covered by default and unverified under
+`--strict-resources`, with the reason `condition`. A statement with the
+principal `"*"` counts as a session grant. The KMS guide doesn't say how a
+boundary combines with a key policy, so PermCheck applies the session rule to
+a key policy statement too.
+
+A `NotPrincipal` Deny in a resource policy always denies a role with a
+boundary
+([NotPrincipal](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_notprincipal.html)),
+so PermCheck counts such a Deny as definite for a role whose plan sets
+`permissions_boundary`.
+
+###### KMS keys
+
+Key policies follow their own rule. The IAM guide says key policies "must
+explicitly allow access for principals"
+([enforcement code logic](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic_policy-eval-denyallow.html)),
+and the KMS guide says "Without permission from the key policy, IAM policies
+that allow permissions have no effect"
+([key policies](https://docs.aws.amazon.com/kms/latest/developerguide/key-policies.html)).
+PermCheck covers a need on a key when the key policy allows the role itself,
+or when it allows the role's account and an identity policy allows the action.
+A statement for the account, such as `arn:aws:iam::123456789012:root`, lets
+the account's IAM policies grant only the actions that the statement lists
+([elements in a key policy](https://docs.aws.amazon.com/kms/latest/developerguide/key-policy-overview.html#key-policy-elements)).
+So a key policy that gives the account `kms:Describe*` doesn't let an identity
+policy grant `kms:Decrypt`. A definite `Deny` in the key policy or in an
+identity policy makes the need missing.
+
+When the configuration of a key leaves out its policy and no
+`aws_kms_key_policy` sets it, AWS attaches the default key policy
+([CreateKey](https://docs.aws.amazon.com/kms/latest/APIReference/API_CreateKey.html#KMS-CreateKey-request-Policy)).
+That policy lets the account's IAM policies allow every action
+([default key policy](https://docs.aws.amazon.com/kms/latest/developerguide/key-policy-default.html#key-policy-default-allow-root-enable-iam)),
+so PermCheck checks the need against the identity policies. When both the
+key's `policy` and an `aws_kms_key_policy` set the policy, each apply writes
+one of them. PermCheck then counts the grants of each as grants it can't
+check. A need's resource may be an alias ARN, such as
+`arn:aws:kms:us-east-1:123456789012:alias/app-data`. When an `aws_kms_alias`
+of the plan points to the key through `target_key_id`, PermCheck checks the
+need against the key's policy.
+
+AWS requires a key policy on each key, so PermCheck can't read a missing key
+policy as an empty one. When the need's ARN matches no key of the plan, or the
+need has no `resources`, the key policy is unknown. It may allow the role
+itself. PermCheck then counts the need as covered by default. Under
+`--strict-resources` it reports the need unverified with the reason
+`policy_unknown`, even when an identity policy allows the action. The run
+prints a notice for the key. A definite `Deny` in an identity policy still
+makes the need missing. A need on `"*"`, such as `kms:CreateKey`, acts on no
+key, so PermCheck checks it against the identity policies alone
+([IAM policies for KMS](https://docs.aws.amazon.com/kms/latest/developerguide/iam-policies.html)).
+
+A grant gives access to a key apart from key policies and IAM policies
+([grants](https://docs.aws.amazon.com/kms/latest/developerguide/grants.html)).
+PermCheck counts an `aws_kms_grant` of the plan whose grantee may be the role
+as a grant of its operations that it can't check, with the reason `condition`.
+A retiring principal can retire the grant at any time.
+
+###### Needs on a resource in another account
+
+AWS evaluates a request across accounts twice, and "The request is allowed
+only if both evaluations return a decision of `Allow`"
+([cross-account policy evaluation logic](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic-cross-account.html)).
+PermCheck treats a need as cross-account when the account in the need's ARN
+differs from the account in the role's ARN. The role's identity policies and
+its boundary must then allow the need on their own. A resource policy grant
+to the role, or to a session of the role, doesn't make up for a gap there.
+The resource policy must allow the need too. A statement for the role's
+account counts as an `Allow` on that side. A KMS key in another account
+follows the two-sided rule, so a key policy statement for the role needs an
+identity grant as well
+([allowing users in other accounts to use a KMS key](https://docs.aws.amazon.com/kms/latest/developerguide/key-policy-modifying-external-accounts.html)).
+
+When the plan doesn't contain the resource's policy, PermCheck counts the need
+as covered by default and prints a notice for the resource. Under
+`--strict-resources` it reports the need unverified with the reason
+`cross_account`. A resource policy that PermCheck doesn't read, such as a
+role's trust policy for `sts:AssumeRole`, gets the `cross_account` reason too:
+
+```
+notice: arn:aws:iam::444455556666:role/deploy is outside the account of "task", and its resource policy isn't in the plan; needs of "task" on it depend on that policy
+```
+
+PermCheck uses the one-account rule when it can't read both accounts. That
+happens when the plan creates the role and AWS assigns its ARN at apply time,
+when the need has no `resources`, and for S3. A bucket ARN has an empty
+account field, and the plan doesn't say which account a provider alias uses.
+
+##### Assumptions and limits
+
+A covered verdict means "covered by the policies the plan shows". PermCheck
+reports a need missing only when the plan proves the gap, and these
+assumptions bound that proof.
+
+For a role or user in the plan, PermCheck assumes the plan lists every policy
+of it, and every group membership of a user. A policy or a membership that
+another stack or a person adds can grant a need that PermCheck reports as
+missing. The provider docs say that a configuration can use
+`aws_iam_user_group_membership` "multiple times with the same user for
+non-overlapping groups", so it doesn't set the whole group list of the user.
+An `aws_iam_group_membership` sets the whole user list of its group, and it
+"will conflict with itself if used more than once with the same group".
+Neither lists every group of a user.
+
+The exclusive resources of the AWS provider make the plan list every policy of
+a role, a user or a group. The provider removes any policy of their kind that
+their list leaves out:
+
+- `aws_iam_role_policies_exclusive`, `aws_iam_user_policies_exclusive` and
+  `aws_iam_group_policies_exclusive` list, in `policy_names`, the names of the
+  inline policies.
+- `aws_iam_role_policy_attachments_exclusive`,
+  `aws_iam_user_policy_attachments_exclusive` and
+  `aws_iam_group_policy_attachments_exclusive` list, in `policy_arns`, the
+  ARNs of the attached managed policies.
+
+The exclusive resources don't change the assumption for a role or user in the
+plan. They can remove a policy that the plan defines but that their list
+leaves out. Terraform may then attach that policy again in the same apply, so
+PermCheck can't tell whether it stays. It treats such a policy as one whose
+link to the role is undecidable. That way the removal can't turn into a
+missing need that the apply would disprove.
+
+A role or user outside the plan gets a different rule, since other stacks
+usually attach its policies. PermCheck adds an implicit unknown source for the
+policies attached outside the plan. A need that the plan's policies don't
+grant is then covered by default, and unverified under `--strict-resources`
+with the reason `policy_unknown`. When the plan has both exclusive resources
+for a role outside the plan, PermCheck drops the implicit source, and a need
+that the plan's policies don't grant is missing. With one of them, the
+implicit source stays for the other kind. For a user outside the plan, the
+implicit source stays for `groups`, since other stacks may add the user to
+groups and no resource lists every group of a user. A list that terraform
+computes at apply time still covers its kind, and PermCheck reads it as one
+unknown source. An inline policy that `policy_names` lists and that the plan
+doesn't define stays on the principal, so it's an unknown source too. The plan
+doesn't show the boundary of a role or user outside the plan, and PermCheck
+counts it as allowing.
+
+A membership can put a user in a group that the plan doesn't create: a known
+group name with no `aws_iam_group` and no group policy in the plan. The plan
+can't show that group's policies, so the group is an unknown source. A
+membership may also refer to such a group when terraform computes the group's
+name at apply time. When the plan has both
+`aws_iam_group_policies_exclusive` and
+`aws_iam_group_policy_attachments_exclusive` for the group, the plan lists
+every policy of the group, and the source goes away.
+
+PermCheck assumes that the plan lists every resource policy too. For a
+resource that the plan doesn't contain, or whose policy the plan doesn't set,
+PermCheck sees an empty resource policy, and checks the need against the
+identity policies alone. A resource policy set outside the plan can grant a need that PermCheck
+reports as missing, or deny a need that it reports as covered. KMS grants that
+AWS services or other stacks create aren't in the plan either, so PermCheck
+may report a need as missing when such a grant allows it.
+
+Some kinds of policy can only remove permissions, and PermCheck doesn't read
+them. It counts each as allowing, so a missing verdict is still provable:
+
+- Service control policies apply to the principal's account and resource
+  control policies to the resource's account, and both must allow the request
+  ([evaluating identity-based policies with SCPs or RCPs](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html#policy-eval-basics-id-scp)).
+  The plan may contain an `aws_organizations_policy`, but it doesn't show
+  which account the principal runs in.
+- A session policy comes from the call that created the session, and the plan
+  never shows it.
+- A VPC endpoint policy limits the requests that go through the endpoint
+  ([endpoint policies](https://docs.aws.amazon.com/vpc/latest/privatelink/vpc-endpoints-access.html)).
+  The plan doesn't show which path a request takes.
+- A role's trust policy must allow `sts:AssumeRole`. In one account, PermCheck
+  checks an `sts:AssumeRole` need against the identity policies alone.
+
+The `json` report of a run that checks a mapped need lists these kinds in
+`not_evaluated`.
+
+##### Unknown sources and the report
+
+A policy source whose text PermCheck can't read is an unknown source:
+
+- a policy whose text terraform computes at apply time.
+- a managed policy outside the plan, such as an AWS managed policy without a
+  data block.
+- a resource policy of a type that PermCheck doesn't read yet. It applies to
+  the needs whose action is in its service.
+- the implicit source of a role or user outside the plan, or of a group
+  outside the plan.
+- the key policy of a KMS key outside the plan.
+
+An unknown source may grant the need, so PermCheck counts the need as covered
+by default and reports it unverified under `--strict-resources`, with the
+reason `policy_unknown`. An unknown boundary can only limit a need, so it
+never covers one, and it makes the need unverified under `--strict-resources`.
+An unknown source never denies.
+
+The plan leaves some links undecidable. A known ARN may match an `aws_iam_policy`
+whose ARN the plan doesn't know yet, such as one with `name_prefix`, so
+PermCheck can't decide which policy the ARN refers to. The plan may not decide
+whether a policy attaches to the role or user. In both cases the policy's
+`Allow` statements count as grants PermCheck can't check, with the reason
+`condition`, and PermCheck ignores its `Deny` statements.
+
+Under `--strict-resources`, a need of a mapped principal that only such a
+grant covers is unverified with one of these reasons:
+
+| Reason | The grant PermCheck can't check |
+|--------|---------------------------------|
+| `condition` | a policy whose link to the principal is undecidable, a resource policy grant to an ARN with the role's name in an unknown account, a session grant that the boundary doesn't allow, a KMS grant, or a condition PermCheck can't evaluate |
+| `resource_scope` | a resource policy whose resource may be the need's resource |
+| `policy_unknown` | an unknown source, including an unknown boundary and the key policy of a KMS key outside the plan |
+| `cross_account` | a resource in another account whose resource policy the plan doesn't contain, or that PermCheck doesn't read |
+
+Every format but `json` prints one notice on stderr for each unknown source
+and principal. A notice doesn't change the exit code:
+
+```
+notice: aws_iam_role_policy.task_secrets: policy text is known only after apply; needs of "task" may be granted by it
+```
+
+The notice for a managed policy outside the plan gives the fix. For a
+boundary, it says the needs may be limited by it:
+
+```
+notice: aws_iam_role_policy_attachment.deploy_ecr: arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser is a managed policy that the plan doesn't contain; needs of "deploy" may be granted by it; a data "aws_iam_policy" block with this arn gives PermCheck its text
+notice: aws_iam_role.task: arn:aws:iam::aws:policy/PowerUserAccess is a managed policy that the plan doesn't contain; needs of "task" may be limited by it; a data "aws_iam_policy" block with this arn gives PermCheck its text
+```
+
+The notices for a group, a role and a user outside the plan:
+
+```
+notice: aws_iam_user_group_membership.deployer: group ops isn't in the plan, so the plan doesn't show its policies; needs of "deployer" may be granted by them
+notice: role ops-admin is outside the plan, and other stacks may attach inline and managed policies to it; needs of "ops" may be granted by them; an aws_iam_role_policies_exclusive and an aws_iam_role_policy_attachments_exclusive for the role make the plan list every policy of that kind
+notice: user arn:aws:iam::123456789012:user/ci is outside the plan, and other stacks may attach inline and managed policies to it or add it to groups; needs of "ci" may be granted by them; an aws_iam_user_policies_exclusive and an aws_iam_user_policy_attachments_exclusive for the user make the plan list every policy of that kind
+```
+
+A finding of a mapped need shows the label, as in
+`needs "FetchSecrets" of task`. The `json` report adds these keys only when a
+run checks a mapped need:
+
+- `principal` on each finding of a mapped need: the need's label.
+- `boundary` on a finding that the permissions boundary makes missing.
+- `policy_sources`: one entry per mapped principal, in label order, with its
+  `principal`, the `address`, `name` or `arn` from its entry, and its
+  `sources`. A role or user outside the plan also has `complete`, which is
+  `true` when the plan has both exclusive resources for a role. It's always
+  `false` for a user outside the plan.
+- `plan_resources_skipped`: `true` when the run had no `--policy-*` source.
+- `not_evaluated`: the kinds of policy that PermCheck counts as allowing
+  without reading them, `scp`, `rcp`, `session_policy`,
+  `vpc_endpoint_policy` and `role_trust_policy`.
+
+Each entry of `sources` has these fields:
+
+| Field | Value |
+|-------|-------|
+| `address` | the terraform address of the resource that sets the policy. The implicit source of a principal outside the plan has none |
+| `path` | the attribute path of the policy in that resource, such as `policy` or `inline_policy.0.policy` |
+| `kind` | `identity`, `boundary` or `resource` |
+| `text` | `known`, or `unknown` for an unknown source |
+| `unknown_reason` | for an unknown source: `computed`, `unread`, `outside_plan` for a managed policy, an inline policy that an exclusive resource lists, a group outside the plan, or the key policy of a KMS key outside the plan, `attached_outside_plan` for the implicit source of a principal outside the plan, or `cross_account` |
+| `link` | `yes`, or `maybe` when PermCheck can't decide it from the plan. A resource policy is `yes` when its resource is the resource of a checked need, and `maybe` when it may be |
+| `policy_arn` | the known ARN of the managed policy that the source attaches |
+| `policy_name` | the known name of an inline policy |
+| `policy` | the address of the `aws_iam_policy` or `data "aws_iam_policy"` whose text PermCheck read |
+| `group` | for a group policy of a user, the address of the `aws_iam_group` it comes through, or the group's name for a group outside the plan |
+| `resource` | for the implicit source of a KMS key outside the plan or of a resource in another account, the need's resource |
+| `unlisted` | for the implicit source of a principal outside the plan, the kinds of policy the plan may not show: `inline`, `managed`, and `groups` for a user |
 
 ## Supported clouds
 
@@ -654,7 +1200,9 @@ terraform-permcheck validate --terraform-root ./terraform \
 
 The policy comes from exactly one of `--policy-file`,
 `--policy-from-plan-output` and `--policy-from-state-output`. Static HCL mode
-accepts `--policy-file` only.
+accepts `--policy-file` only. A plan-mode run whose needs are all mapped
+principals' needs may omit it (see
+[Needs of a role or user in the plan](#needs-of-a-role-or-user-in-the-plan)).
 
 ### Flags of `validate`
 
@@ -673,7 +1221,7 @@ accepts `--policy-file` only.
 | `--no-filter` | `false` | Report every permission the schema sources list, including `[optional]` ones |
 | `--config` | `./permcheck.json` | Path to the config file (auto-discovered in the working directory when present) |
 | `--show-excluded` | `false` | List config-excluded permissions in the report (suppressed silently by default) |
-| `--principal` | none | Also check the config needs declared for this principal (see [Permissions a principal needs beyond terraform](#permissions-a-principal-needs-beyond-terraform)) |
+| `--principal` | none | Also check the config needs declared for this principal. Without it, a run checks the needs without a principal and the needs of every principal in the config's `principals` map (see [Permissions a principal needs beyond terraform](#permissions-a-principal-needs-beyond-terraform) and [Needs of a role or user in the plan](#needs-of-a-role-or-user-in-the-plan)) |
 | `--aws-provider-version` | none | Check against the requirements of this AWS provider major version, such as `5` or `5.100.0`. Without it, PermCheck reads the version from the lock file of `--terraform-root` or of the working directory, or from the plan (see [Which provider version a run checks](#which-provider-version-a-run-checks)). The config key `aws_provider_version` sets the default |
 | `--provider-source` | `embedded` | Where provider-source permissions come from: `embedded` reads the table built into the binary, `live` clones and parses terraform-provider-aws (see [Embedded permissions table](#embedded-permissions-table)). `PERMCHECK_PROVIDER_SOURCE` sets the default |
 | `--strict-resources` | `false` | Report an action as unverified when the tool cannot check the grant: its target ARN is unknown and the policy grants it only on some resources, or a condition on the grant names a key the plan does not supply (see [Strict resource scope](#strict-resource-scope)). The config key `strict_resources` sets the default |
@@ -683,12 +1231,15 @@ accepts `--policy-file` only.
 
 | Format | stdout | stderr |
 |--------|--------|--------|
-| `text` | The all-clear line | Findings and the summary line |
-| `github-annotations` | Annotations, the summary line and the all-clear line | Nothing |
+| `text` | The all-clear line | Findings, the summary line, and the notices of a run with mapped principals |
+| `github-annotations` | Annotations, the summary line and the all-clear line | The notices of a run with mapped principals |
 | `json` | The JSON report | Nothing |
 
 Error messages, usage errors and warnings, such as a file map that
-`--terraform-root` can't build, go to stderr in every format. `help` and `-h`
+`--terraform-root` can't build, go to stderr in every format. The notices of
+a run with mapped principals go to stderr in the `text` and
+`github-annotations` formats (see
+[Unknown sources and the report](#unknown-sources-and-the-report)). `help` and `-h`
 print to stdout.
 
 ### Exit codes
@@ -783,7 +1334,7 @@ release tag:
     terraform show -json plan.tfplan > plan.json
 
 - name: Check IAM permissions
-  uses: elecnix/terraform-permcheck@v0.10.3
+  uses: elecnix/terraform-permcheck@v0.11.0
   with:
     plan-file: plan.json
     policy-file: deploy_policy.json
@@ -816,7 +1367,7 @@ file also sets:
 
 | Input | Default | What it does |
 |-------|---------|--------------|
-| `principal` | empty | Also check the config file's `needs` declared for this principal, as `--principal` does (see [Permissions a principal needs beyond terraform](#permissions-a-principal-needs-beyond-terraform)). Empty checks only the needs that apply to every run |
+| `principal` | empty | Also check the config file's `needs` declared for this principal, as `--principal` does (see [Permissions a principal needs beyond terraform](#permissions-a-principal-needs-beyond-terraform)). Empty checks the needs without a principal and the needs of every principal in the config's `principals` map |
 | `strict-resources` | empty | Report an action as unverified when its target ARN is unknown and the policy grants it only on some resources, as `--strict-resources` does. Empty leaves the config file's `strict_resources` in charge, and `"false"` overrides that config and turns the check off |
 | `allow-unresolved-types` | empty | Report resource types that no schema source knows but don't fail the run on them, as `--allow-unresolved-types` does. Empty leaves the config file's `allow_unresolved_types` in charge, and `"false"` overrides that config and fails on them |
 

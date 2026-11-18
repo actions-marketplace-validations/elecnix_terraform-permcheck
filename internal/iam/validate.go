@@ -56,6 +56,12 @@ const (
 	// ReasonCondition means a condition on the grant names a key the plan
 	// does not supply, or an operator the tool does not model.
 	ReasonCondition = policy.ReasonCondition
+	// ReasonPolicyUnknown means the grant comes from a policy source whose
+	// text the plan does not show.
+	ReasonPolicyUnknown = policy.ReasonPolicyUnknown
+	// ReasonCrossAccount means the need crosses accounts and the resource
+	// policy in the other account is not in the plan.
+	ReasonCrossAccount = policy.ReasonCrossAccount
 )
 
 // MissingAction is a single required permission found to be absent from the policy.
@@ -79,6 +85,12 @@ type MissingAction struct {
 	// tool does not model. The grant may or may not apply, so the finding
 	// is unverified, not missing.
 	ConditionUnverified bool
+	// PolicyUnknownUnverified marks an action that only a policy source
+	// whose text the plan does not show may grant (--strict-resources).
+	PolicyUnknownUnverified bool
+	// CrossAccountUnverified marks a cross-account action whose resource
+	// policy in the other account is not in the plan (--strict-resources).
+	CrossAccountUnverified bool
 	// ConditionAttribute is the attribute gating this action, e.g.
 	// "kms_key_arn": set in the planned resource (d.GetOk) or changed between
 	// prior and planned state (d.HasChange). Empty for an unconditional action.
@@ -87,6 +99,10 @@ type MissingAction struct {
 	// empty for an action a terraform resource change needs, and then the
 	// resource fields name the source instead.
 	Need string
+	// Principal is the label of the mapped principal whose need this action
+	// comes from, when the config's principals map gives the need's label
+	// a role in the plan. It is empty for any other finding.
+	Principal string
 	// NeedResource is the resource of the need that the policy does not
 	// cover. Empty when the need lists no resources.
 	NeedResource string
@@ -104,6 +120,11 @@ type MissingAction struct {
 	// resources that do not cover the target. Empty when the policy does not
 	// grant Action at all, or grants it on every resource.
 	GrantedOn []string
+	// Boundary names the permissions boundary of a mapped principal that
+	// makes Action missing while its other policies allow it, such as the
+	// address of the aws_iam_policy that holds the boundary's text (see
+	// policy.Result.Boundary). It is empty for any other finding.
+	Boundary string
 	// Unresolved marks a resource change whose type no schema source knows.
 	// The tool has no permission data for it, so Action is empty and the
 	// change was not checked.
@@ -311,11 +332,18 @@ func newFinding(action string, class Class, res policy.Result) MissingAction {
 		Service: actionService(action),
 		Class:   class,
 	}
+	if res.Verdict == policy.Missing {
+		m.Boundary = res.Boundary
+	}
 	switch res.Reason {
 	case policy.ReasonCondition:
 		m.ConditionUnverified = true
 	case policy.ReasonResourceScope:
 		m.ResourceScopeUnverified = true
+	case policy.ReasonPolicyUnknown:
+		m.PolicyUnknownUnverified = true
+	case policy.ReasonCrossAccount:
+		m.CrossAccountUnverified = true
 	}
 	return m
 }

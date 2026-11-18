@@ -34,7 +34,10 @@ type Need struct {
 // Two needs that run together must have different sids, or the report shows
 // two findings with the same source. A need without a principal runs with
 // every principal, so its sid must be unique in the whole list. Needs under
-// two different principals never run together, so they may share a sid.
+// two different principals may share a sid. Two unmapped principals never
+// run together. Two mapped principals do, and the report names the
+// principal of each finding, so their findings stay apart (see
+// resourceMatches for the exclusion that names one of them).
 func ValidateNeeds(needs []Need) error {
 	seen := map[string]bool{}     // principal and sid
 	unnamed := map[string]bool{}  // sids of needs without a principal
@@ -74,25 +77,46 @@ func ValidateNeeds(needs []Need) error {
 }
 
 // SelectNeeds returns the needs that apply to principal: every need without
-// a principal, plus the needs whose principal equals it. It returns an error
+// a principal, plus the needs whose principal equals it. Without principal,
+// it also returns the needs whose principal is in mapped, the labels that
+// the config's principals map gives a role in the plan. It returns an error
 // when principal is set and no need names it, so a typo does not pass
 // silently.
-func SelectNeeds(needs []Need, principal string) ([]Need, error) {
+func SelectNeeds(needs []Need, principal string, mapped map[string]bool) ([]Need, error) {
 	var out []Need
 	named := false
 	for _, n := range needs {
-		switch n.Principal {
-		case "":
+		switch {
+		case n.Principal == "":
 			out = append(out, n)
-		case principal:
+		case n.Principal == principal:
 			out = append(out, n)
 			named = true
+		case principal == "" && mapped[n.Principal]:
+			out = append(out, n)
 		}
 	}
 	if principal != "" && !named {
 		return nil, fmt.Errorf("no needs declared for principal %q", principal)
 	}
 	return out, nil
+}
+
+// Grants decides whether a principal's policies grant an action. A
+// *policy.Document is one: the policy a run reads from its --policy-*
+// source. The policy set of a mapped principal is another.
+type Grants interface {
+	// Coverage reports whether the policies grant action on a resource
+	// matching any of the target ARN patterns, as
+	// policy.Document.Coverage does.
+	Coverage(action string, targets []string, conds policy.Conditions, strict bool) policy.Result
+	// CoverageOfEveryResource reports whether the policies grant action on
+	// every resource, as policy.Document.CoverageOfEveryResource does.
+	CoverageOfEveryResource(action string, strict bool) policy.Result
+	// GrantedResources lists the resources the policies grant action on,
+	// when they grant it only on some, as
+	// policy.Document.GrantedResources does.
+	GrantedResources(action string) []string
 }
 
 // CheckNeeds reports each need action the policy does not grant, one
@@ -102,28 +126,44 @@ func SelectNeeds(needs []Need, principal string) ([]Need, error) {
 // limited to some resources as unverified. A need on "*" needs a grant on
 // every resource. Every case goes through Coverage.
 func CheckNeeds(needs []Need, doc *policy.Document, strict bool) []MissingAction {
+	return CheckNeedsWith(needs, func(string, string) Grants { return doc }, strict)
+}
+
+// CheckNeedsWith checks the needs as CheckNeeds does, against the policies
+// that grantsFor returns for each action and resource of a need. The
+// policies of a mapped principal depend on both: a resource policy applies
+// only to the actions of its service, and only to the resource it is
+// attached to. resource is one entry of the need's resources, "*" for a need
+// on every resource, or "" for a need without resources and for a dependent
+// action, whose resource is unknown.
+func CheckNeedsWith(needs []Need, grantsFor func(action, resource string) Grants, strict bool) []MissingAction {
 	var missing []MissingAction
 	for _, n := range needs {
 		for _, action := range n.Actions {
-			add := func(resource string, res policy.Result) {
+			add := func(doc Grants, resource string, res policy.Result) {
 				m := newFinding(action, ClassManagement, res)
 				m.Need = n.Sid
 				m.NeedResource = resource
 				m.Reason = n.Reason
 				// A grant limited to other resources is the likely cause of a
 				// miss on a resource the need names: say where it does apply.
-				if res.Verdict == policy.Missing && resource != "" {
+				// A miss that a permissions boundary causes names the
+				// boundary instead (see newFinding), since the policies grant
+				// the action on the need's resource.
+				if res.Verdict == policy.Missing && resource != "" && res.Boundary == "" {
 					m.GrantedOn = doc.GrantedResources(action)
 				}
 				missing = append(missing, m)
 			}
 			if len(n.Resources) == 0 {
+				doc := grantsFor(action, "")
 				if v := doc.Coverage(action, nil, nil, strict); v.Verdict != policy.Covered {
-					add("", v)
+					add(doc, "", v)
 				}
 				continue
 			}
 			for _, r := range n.Resources {
+				doc := grantsFor(action, r)
 				// A need on "*" needs a grant on every resource, so a grant
 				// limited to some resources falls short of it even without
 				// strict mode. A grant on every resource whose condition the
@@ -131,12 +171,12 @@ func CheckNeeds(needs []Need, doc *policy.Document, strict bool) []MissingAction
 				// reports it unverified.
 				if r == "*" {
 					if res := doc.CoverageOfEveryResource(action, strict); res.Verdict != policy.Covered {
-						add(r, res)
+						add(doc, r, res)
 					}
 					continue
 				}
 				if v := doc.Coverage(action, []string{r}, nil, strict); v.Verdict != policy.Covered {
-					add(r, v)
+					add(doc, r, v)
 				}
 			}
 		}
@@ -154,7 +194,7 @@ func CheckNeeds(needs []Need, doc *policy.Document, strict bool) []MissingAction
 					continue
 				}
 				listed[dep.action] = true
-				if res := dependencyVerdict(dep.action, doc, strict); res.Verdict != policy.Covered {
+				if res := dependencyVerdict(dep.action, grantsFor(dep.action, ""), strict); res.Verdict != policy.Covered {
 					m := newFinding(dep.action, ClassManagement, res)
 					m.Need = n.Sid
 					m.Reason = n.Reason

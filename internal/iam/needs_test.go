@@ -176,16 +176,28 @@ func TestSelectNeeds(t *testing.T) {
 		return out
 	}
 
-	got, err := SelectNeeds(needs, "")
+	got, err := SelectNeeds(needs, "", nil)
 	if err != nil || !reflect.DeepEqual(sids(got), []string{"Shared"}) {
 		t.Errorf("no principal: got %v, %v; want [Shared]", sids(got), err)
 	}
-	got, err = SelectNeeds(needs, "deploy")
+	got, err = SelectNeeds(needs, "deploy", nil)
 	if err != nil || !reflect.DeepEqual(sids(got), []string{"Shared", "Deploy"}) {
 		t.Errorf("deploy: got %v, %v; want [Shared Deploy]", sids(got), err)
 	}
-	if _, err := SelectNeeds(needs, "deploi"); err == nil || !strings.Contains(err.Error(), `"deploi"`) {
+	if _, err := SelectNeeds(needs, "deploi", nil); err == nil || !strings.Contains(err.Error(), `"deploi"`) {
 		t.Errorf("unknown principal: want an error naming it, got %v", err)
+	}
+
+	// Without --principal, the needs of mapped principals run too. With it,
+	// only the named principal's needs do, mapped or not.
+	mapped := map[string]bool{"task": true}
+	got, err = SelectNeeds(needs, "", mapped)
+	if err != nil || !reflect.DeepEqual(sids(got), []string{"Shared", "Task"}) {
+		t.Errorf("no principal, task mapped: got %v, %v; want [Shared Task]", sids(got), err)
+	}
+	got, err = SelectNeeds(needs, "deploy", mapped)
+	if err != nil || !reflect.DeepEqual(sids(got), []string{"Shared", "Deploy"}) {
+		t.Errorf("deploy, task mapped: got %v, %v; want [Shared Deploy]", sids(got), err)
 	}
 }
 
@@ -205,6 +217,35 @@ func TestExclusions_MatchNeeds(t *testing.T) {
 	kept, _ = ApplyExclusions(missing[:1], []Exclusion{{Permission: "ecr:PutImage", Operations: []string{"create"}}})
 	if len(kept) != 1 {
 		t.Errorf("an operations exclusion must not match a need, kept %+v", kept)
+	}
+}
+
+// TestExclusions_MatchNeedsOfOnePrincipal checks the needs of two mapped
+// principals that share a sid. A pattern "needs.<label>.<sid>" matches the
+// need of one principal, and "needs.<sid>" matches the sid of every
+// principal, as it matches an unmapped need.
+func TestExclusions_MatchNeedsOfOnePrincipal(t *testing.T) {
+	missing := []MissingAction{
+		{Action: "s3:GetObject", Need: "Read", Principal: "task"},
+		{Action: "s3:GetObject", Need: "Read", Principal: "deploy"},
+		{Action: "s3:GetObject", Need: "Read"},
+	}
+	who := func(ms []MissingAction) string {
+		var out []string
+		for _, m := range ms {
+			out = append(out, m.Principal+"/"+m.Need)
+		}
+		return strings.Join(out, ",")
+	}
+	for pattern, want := range map[string]string{
+		"needs.deploy.Read": "task/Read,/Read",
+		"needs.*.Read":      "/Read",
+		"needs.Read":        "",
+	} {
+		kept, _ := ApplyExclusions(missing, []Exclusion{{Permission: "s3:GetObject", Resource: pattern}})
+		if got := who(kept); got != want {
+			t.Errorf("%s: kept %s, want %s", pattern, got, want)
+		}
 	}
 }
 
